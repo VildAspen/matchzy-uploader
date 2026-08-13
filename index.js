@@ -16,8 +16,9 @@ const s3 = new S3Client({
 
 app.post('/upload', async (req, res) => {
   try {
-    const filename = req.header('MatchZy-FileName') || `demo_${Date.now()}.dem`;
-    const matchId = req.header('MatchZy-MatchId') || '1';
+    // Skapar ett rent filnamn med datum och tid så vi slipper header-kraschen
+    const dateStr = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `demo_${dateStr}.dem`;
 
     await s3.send(new PutObjectCommand({
       Bucket: process.env.S3_BUCKET_NAME,
@@ -31,11 +32,11 @@ app.post('/upload', async (req, res) => {
     if (process.env.DISCORD_WEBHOOK_URL) {
       await axios.post(process.env.DISCORD_WEBHOOK_URL, {
         embeds: [{
-          title: "🎬 MatchZy Demo Redo!",
-          description: `Match-ID: **${matchId}**\nFil: \`${filename}\``,
+          title: "🎬 GubbLir Demo Redo!",
+          description: `Fil: \`${filename}\``,
           color: 0xD4AF37,
-          fields: [{ name: "Ladda ner", value: `[Klicka här för att ladda ner](${demoUrl})` }],
-          footer: { text: "GubbLir Demos" }
+          fields: [{ name: "Ladda ner demo", value: `[Klicka här för att ladda ner](${demoUrl})` }],
+          footer: { text: "GubbLir CS2" }
         }]
       });
     }
