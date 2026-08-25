@@ -1,9 +1,10 @@
+// Körs i Node.js på Render
 const express = require('express');
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client } = require('@aws-sdk/client-s3');
+const { Upload } = require('@aws-sdk/lib-storage');
 const axios = require('axios');
 
 const app = express();
-app.use(express.raw({ type: '*/*', limit: '500mb' }));
 
 const s3 = new S3Client({
   region: 'auto',
@@ -16,16 +17,24 @@ const s3 = new S3Client({
 
 app.post('/upload', async (req, res) => {
   try {
-    // Skapar ett rent filnamn med datum och tid så vi slipper header-kraschen
     const dateStr = new Date().toISOString().replace(/[:.]/g, '-');
     const filename = `demo_${dateStr}.dem`;
 
-    await s3.send(new PutObjectCommand({
-      Bucket: process.env.S3_BUCKET_NAME,
-      Key: filename,
-      Body: req.body,
-      ContentType: 'application/octet-stream',
-    }));
+    // Strömma request-streamen (req) direkt till S3 utan att buffra i RAM
+    const parallelUploads3 = new Upload({
+      client: s3,
+      params: {
+        Bucket: process.env.S3_BUCKET_NAME,
+        Key: filename,
+        Body: req,
+        ContentType: 'application/octet-stream',
+      },
+      queueSize: 1, // En chunk i taget för minimalt RAM-avtryck
+      partSize: 1024 * 1024 * 5, // 5 MB per bit
+      leavePartsOnError: false,
+    });
+
+    await parallelUploads3.done();
 
     const demoUrl = `${process.env.PUBLIC_URL}/${filename}`;
 
@@ -43,9 +52,13 @@ app.post('/upload', async (req, res) => {
 
     res.status(200).send('OK');
   } catch (err) {
-    console.error(err);
+    console.error('Uppladdningsfel:', err);
     res.status(500).send('Error');
   }
+});
+
+app.get('/', (req, res) => {
+  res.send('MatchZy S3 Uploader är igång och redo.');
 });
 
 app.listen(process.env.PORT || 3000, () => console.log('Uploader running!'));
