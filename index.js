@@ -7,7 +7,7 @@ const { GameDig } = require('gamedig');
 
 const app = express();
 
-// CORS så att Cloudflare Worker eller webbläsaren kan hämta spelarlistan
+// Tillåt anrop från webbläsare och Workers (CORS)
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
@@ -23,12 +23,12 @@ const s3 = new S3Client({
   },
 });
 
-// 1. Live Players Query direkt mot CS2-servern
+// 1. Live Players Query direkt mot CS2-servern via UDP
 app.get('/api/server/live', async (req, res) => {
   try {
     const state = await GameDig.query({
       type: 'cs2',
-      host: '212.102.62.209', // Serverns råa IP från DatHost
+      host: '212.102.62.209', // DatHost rå IP
       port: 25152             // Serverns spelport
     });
 
