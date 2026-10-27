@@ -26,35 +26,61 @@ const s3 = new S3Client({
 let cachedStatus = null;
 let lastQueryTime = 0;
 
+// Exakt parser för Source 2 / CS2 status
 function parseCS2Status(rawText) {
   const players = [];
   const lines = rawText.split('\n');
 
   let currentMap = 'de_dust2';
-  for (const line of lines) {
-    if (line.includes('map :') || line.includes('map:')) {
-      const match = line.match(/map\s*:\s*([^\s]+)/i);
-      if (match) currentMap = match[1];
+
+  // Hämta kartnamn
+  const mapMatch = rawText.match(/Map\s+"([^"]+)"/i) || rawText.match(/spawngroup\(\s*1\)\s*:\s*SV:\s*\[\d+:\s*([^\s|]+)/i);
+  if (mapMatch) {
+    currentMap = mapMatch[1];
+  }
+
+  // Leta efter spelarsektionen
+  let inPlayerSection = false;
+
+  for (let line of lines) {
+    const trimmed = line.trim();
+
+    if (trimmed.includes('---------players--------')) {
+      inPlayerSection = true;
+      continue;
     }
 
-    // Mer flexibel regex för CS2 status-rader:
-    // Exempel: # 2 1 "Aspen" STEAM_1:0:123456 04:12 45 0 active
-    // Eller:   # 2 "Aspen" [U:1:123456] ...
-    const playerMatch = line.match(/^#\s+\d+\s+(?:\d+\s+)?"([^"]+)"\s+([^\s]+)\s+([^\s]+)/);
-    if (playerMatch) {
-      const name = playerMatch[1];
-      const timeStr = playerMatch[3];
-      
-      let totalSeconds = 0;
-      if (timeStr && timeStr.includes(':')) {
-        const parts = timeStr.split(':').map(Number);
-        if (parts.length === 2) totalSeconds = parts[0] * 60 + parts[1];
-        if (parts.length === 3) totalSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (inPlayerSection) {
+      if (trimmed === '#end' || trimmed.startsWith('--- SourceTV')) {
+        inPlayerSection = false;
+        break;
       }
 
-      if (!name.toLowerCase().includes('bot') && !name.toLowerCase().includes('gotv')) {
+      // Format: 0 00:32 10 0 active 786432 82.196.117.28:49491 'Aspen'
+      // Matchar rader som avslutas med 'Namn'
+      const match = trimmed.match(/^(\d+)\s+([^\s]+)\s+(\d+)\s+(\d+)\s+([^\s]+)\s+(\d+)\s+([^\s]+)\s+'([^']+)'$/);
+
+      if (match) {
+        const timeStr = match[2];
+        const ping = parseInt(match[3], 10);
+        const name = match[8];
+
+        // Hoppa över SourceTV, bots och odefinierade anslutningar
+        if (timeStr === 'BOT' || name === 'SourceTV' || name === '') {
+          continue;
+        }
+
+        // Räkna om tid (mm:ss eller hh:mm:ss) till sekunder
+        let totalSeconds = 0;
+        if (timeStr.includes(':')) {
+          const parts = timeStr.split(':').map(Number);
+          if (parts.length === 2) totalSeconds = parts[0] * 60 + parts[1];
+          if (parts.length === 3) totalSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+        }
+
         players.push({
           name: name,
+          ping: ping,
           time: totalSeconds
         });
       }
@@ -64,6 +90,7 @@ function parseCS2Status(rawText) {
   return { currentMap, players };
 }
 
+// 1. Live Players Query via RCON
 app.get('/api/server/live', async (req, res) => {
   const now = Date.now();
   if (cachedStatus && (now - lastQueryTime < 3000)) {
@@ -84,10 +111,6 @@ app.get('/api/server/live', async (req, res) => {
 
       const response = await rcon.send('status');
       await rcon.end();
-
-      console.log('--- CS2 RAW STATUS START ---');
-      console.log(response);
-      console.log('--- CS2 RAW STATUS END ---');
 
       const { currentMap, players } = parseCS2Status(response);
 
@@ -148,6 +171,7 @@ app.get('/api/server/live', async (req, res) => {
   }
 });
 
+// 2. Demo Upload från MatchZy
 app.post('/upload', async (req, res) => {
   try {
     const dateStr = new Date().toISOString().replace(/[:.]/g, '-');
