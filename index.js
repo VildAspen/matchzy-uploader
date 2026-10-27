@@ -8,7 +8,6 @@ const { Rcon } = require('rcon-client');
 
 const app = express();
 
-// Tillåt anrop från webbläsare och Cloudflare Workers (CORS)
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
@@ -24,29 +23,28 @@ const s3 = new S3Client({
   },
 });
 
-// Cache för att inte överbelasta servern med RCON vid tät polling
 let cachedStatus = null;
 let lastQueryTime = 0;
 
-// Parser för CS2 "status"-utskrift
 function parseCS2Status(rawText) {
   const players = [];
   const lines = rawText.split('\n');
 
   let currentMap = 'de_dust2';
   for (const line of lines) {
-    if (line.includes('map :')) {
+    if (line.includes('map :') || line.includes('map:')) {
       const match = line.match(/map\s*:\s*([^\s]+)/i);
       if (match) currentMap = match[1];
     }
-    // CS2 status format: # 2 1 "Aspen" STEAM_1:0:123456 04:12 45 0 active
-    // Matchar rader som börjar med # [userid] [slot] "[name]"
-    const playerMatch = line.match(/^#\s+\d+\s+\d+\s+"([^"]+)"\s+(STEAM_[^\s]+|\[U:[^\s]+\])\s+([^\s]+)/);
+
+    // Mer flexibel regex för CS2 status-rader:
+    // Exempel: # 2 1 "Aspen" STEAM_1:0:123456 04:12 45 0 active
+    // Eller:   # 2 "Aspen" [U:1:123456] ...
+    const playerMatch = line.match(/^#\s+\d+\s+(?:\d+\s+)?"([^"]+)"\s+([^\s]+)\s+([^\s]+)/);
     if (playerMatch) {
       const name = playerMatch[1];
       const timeStr = playerMatch[3];
       
-      // Räkna om tidsträng (mm:ss) till sekunder
       let totalSeconds = 0;
       if (timeStr && timeStr.includes(':')) {
         const parts = timeStr.split(':').map(Number);
@@ -54,7 +52,6 @@ function parseCS2Status(rawText) {
         if (parts.length === 3) totalSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
       }
 
-      // Filtrera bort BOTs och GOTV
       if (!name.toLowerCase().includes('bot') && !name.toLowerCase().includes('gotv')) {
         players.push({
           name: name,
@@ -67,11 +64,9 @@ function parseCS2Status(rawText) {
   return { currentMap, players };
 }
 
-// 1. Live Players Query via RCON (med GameDig fallback)
 app.get('/api/server/live', async (req, res) => {
   const now = Date.now();
-  // Returnera cache om förfrågan sker inom 5 sekunder
-  if (cachedStatus && (now - lastQueryTime < 5000)) {
+  if (cachedStatus && (now - lastQueryTime < 3000)) {
     return res.json(cachedStatus);
   }
 
@@ -90,6 +85,10 @@ app.get('/api/server/live', async (req, res) => {
       const response = await rcon.send('status');
       await rcon.end();
 
+      console.log('--- CS2 RAW STATUS START ---');
+      console.log(response);
+      console.log('--- CS2 RAW STATUS END ---');
+
       const { currentMap, players } = parseCS2Status(response);
 
       cachedStatus = {
@@ -98,7 +97,8 @@ app.get('/api/server/live', async (req, res) => {
         map: currentMap,
         playerCount: players.length,
         maxPlayers: 10,
-        players: players
+        players: players,
+        source: 'rcon'
       };
       lastQueryTime = now;
       return res.json(cachedStatus);
@@ -131,7 +131,8 @@ app.get('/api/server/live', async (req, res) => {
       map: state.map || "de_dust2",
       playerCount: parsedPlayers.length,
       maxPlayers: state.maxplayers || 10,
-      players: parsedPlayers
+      players: parsedPlayers,
+      source: 'gamedig'
     };
     lastQueryTime = now;
     return res.json(cachedStatus);
@@ -141,12 +142,12 @@ app.get('/api/server/live', async (req, res) => {
       map: 'de_dust2',
       playerCount: 0,
       maxPlayers: 10,
-      players: []
+      players: [],
+      source: 'none'
     });
   }
 });
 
-// 2. Demo Upload från MatchZy
 app.post('/upload', async (req, res) => {
   try {
     const dateStr = new Date().toISOString().replace(/[:.]/g, '-');
