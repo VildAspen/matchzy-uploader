@@ -1,4 +1,4 @@
-// Körs i Node.js på Render
+// Körs i Node.js på Render (matchzy-uploader)
 const express = require('express');
 const { S3Client } = require('@aws-sdk/client-s3');
 const { Upload } = require('@aws-sdk/lib-storage');
@@ -27,9 +27,12 @@ const s3 = new S3Client({
 app.get('/api/server/live', async (req, res) => {
   try {
     const state = await GameDig.query({
-      type: 'cs2',
+      type: 'counterstrike2', // Officiellt protokoll-ID i GameDig v5
       host: '212.102.62.209', // DatHost rå IP
-      port: 25152             // Serverns spelport
+      port: 25152,            // CS2 spelport
+      givenPortOnly: true,    // Förhindra GameDig att gissa andra query-portar
+      maxAttempts: 2,
+      socketTimeout: 2000
     });
 
     const players = (state.players || []).map(p => ({
@@ -38,7 +41,7 @@ app.get('/api/server/live', async (req, res) => {
       time: p.raw?.time || 0
     }));
 
-    res.json({
+    return res.json({
       online: true,
       name: state.name,
       map: state.map,
@@ -47,12 +50,14 @@ app.get('/api/server/live', async (req, res) => {
       players: players
     });
   } catch (err) {
-    res.json({
+    console.error('GameDig Query Error:', err.message || err);
+    return res.json({
       online: true,
       map: 'de_dust2',
       playerCount: 0,
       maxPlayers: 10,
-      players: []
+      players: [],
+      debug_error: err.message || String(err)
     });
   }
 });
