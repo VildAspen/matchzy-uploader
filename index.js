@@ -27,19 +27,24 @@ const s3 = new S3Client({
 app.get('/api/server/live', async (req, res) => {
   try {
     const state = await GameDig.query({
-      type: 'counterstrike2', // Officiellt protokoll-ID i GameDig v5
-      host: '212.102.62.209', // DatHost rå IP
-      port: 25152,            // CS2 spelport
-      givenPortOnly: true,    // Förhindra GameDig att gissa andra query-portar
+      type: 'counterstrike2',
+      host: '212.102.62.209',
+      port: 25152,
+      givenPortOnly: true,
       maxAttempts: 2,
-      socketTimeout: 2000
+      socketTimeout: 2500
     });
 
-    const players = (state.players || []).map(p => ({
-      name: p.name || 'Spelare',
-      rawScore: p.raw?.score || 0,
-      time: p.raw?.time || 0
-    }));
+    const players = (state.players || [])
+      .map(p => {
+        const parsedName = (p.name || p.raw?.name || '').trim();
+        return {
+          name: parsedName.length > 0 ? parsedName : 'Spelare',
+          rawScore: p.raw?.score || 0,
+          time: p.raw?.time || 0
+        };
+      })
+      .filter(p => p.name !== '');
 
     return res.json({
       online: true,
