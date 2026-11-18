@@ -42,14 +42,111 @@ let cachedStatus = null;
 let lastQueryTime = 0;
 let latestBalancedMatchConfig = null;
 
-function parseCS2Status(rawText) {
+// Internminne som kopplar spelarnamn (lowercase) -> äkta 17-siffrigt SteamID64
+const knownSteamIds = new Map();
+
+function isValidSteamId64(id) {
+  if (!id) return false;
+  const str = String(id).trim();
+  return /^7656\d{13}$/.test(str);
+}
+
+function rememberSteamId(name, steamId) {
+  if (!name || !isValidSteamId64(steamId)) return;
+  knownSteamIds.set(String(name).trim().toLowerCase(), String(steamId).trim());
+}
+
+function resolveSteamId(name, candidateId) {
+  if (isValidSteamId64(candidateId)) {
+    if (name) rememberSteamId(name, candidateId);
+    return String(candidateId).trim();
+  }
+  if (name) {
+    const cached = knownSteamIds.get(String(name).trim().toLowerCase());
+    if (cached) return cached;
+  }
+  return 'unknown';
+}
+
+// Värm upp knownSteamIds från Supabase vid serverstart
+async function warmUpSteamIdCache() {
+  try {
+    const res = await pool.query(`
+      SELECT steamid64, MAX(name) AS name
+      FROM player_stats
+      WHERE steamid64 ~ '^7656[0-9]{13}$'
+      GROUP BY steamid64;
+    `);
+    for (const row of res.rows) {
+      rememberSteamId(row.name, row.steamid64);
+    }
+    console.log(`[Cache] Laddade in ${knownSteamIds.size} kända SteamID64 från Supabase.`);
+  } catch (err) {
+    console.error('[Cache] Kunde inte förladda SteamID64:', err.message);
+  }
+}
+warmUpSteamIdCache();
+
+// 1A. Parser för CS2 status_json (Läser ut SteamID64, namn, ping, tid och karta direkt)
+function parseCS2StatusJson(rawOutput) {
+  if (!rawOutput || typeof rawOutput !== 'string') return null;
+
+  const firstBrace = rawOutput.indexOf('{');
+  const lastBrace = rawOutput.lastIndexOf('}');
+  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+    return null;
+  }
+
+  try {
+    const jsonStr = rawOutput.slice(firstBrace, lastBrace + 1);
+    const parsed = JSON.parse(jsonStr);
+    const srv = parsed.server || parsed;
+
+    const currentMap = srv.map || parsed.map || 'de_dust2';
+    const rawClients = Array.isArray(srv.clients)
+      ? srv.clients
+      : (Array.isArray(parsed.clients) ? parsed.clients : []);
+
+    const players = [];
+
+    for (const c of rawClients) {
+      if (!c || typeof c !== 'object') continue;
+      if (c.bot === true || c.is_bot === true || c.fakeplayer === true) continue;
+
+      const rawName = String(c.name || '').trim();
+      if (!rawName || rawName === 'SourceTV' || rawName === 'GOTV') continue;
+
+      const candidateSteamId = c.steamid64 || c.steam_id_64 || c.xuid || c.steamid;
+      const steamid64 = resolveSteamId(rawName, candidateSteamId);
+
+      const ping = parseInt(c.ping ?? 0, 10);
+      const timeSeconds = parseInt(c.time ?? c.connected_time ?? 0, 10);
+
+      players.push({
+        name: rawName,
+        steamid64: steamid64,
+        ping: isNaN(ping) ? 0 : ping,
+        time: isNaN(timeSeconds) ? 0 : timeSeconds
+      });
+    }
+
+    return { currentMap, players };
+  } catch (err) {
+    return null;
+  }
+}
+
+// 1B. Fallback-parser för klassiska CS2 "status" (om status_json klipps av RCON-bufferten)
+function parseCS2StatusText(rawText) {
   const players = [];
-  const lines = rawText.split('\n');
+  const lines = (rawText || '').split('\n');
   let currentMap = 'de_dust2';
 
-  const mapMatch = rawText.match(/Map\s+"([^"]+)"/i) || rawText.match(/spawngroup\(\s*1\)\s*:\s*SV:\s*\[\d+:\s*([^\s|]+)/i);
+  const mapMatch = rawText.match(/Map\s*:\s*([^\s\r\n"]+)/i) ||
+                   rawText.match(/Map\s+"([^"]+)"/i) ||
+                   rawText.match(/spawngroup\(\s*1\)\s*:\s*SV:\s*\[\d+:\s*([^\s|]+)/i);
   if (mapMatch) {
-    currentMap = mapMatch[1];
+    currentMap = mapMatch[1].trim();
   }
 
   let inPlayerSection = false;
@@ -68,27 +165,34 @@ function parseCS2Status(rawText) {
         break;
       }
 
-      const match = trimmed.match(/^(\d+)\s+([^\s]+)\s+(\d+)\s+(\d+)\s+([^\s]+)\s+(\d+)\s+([^\s]+)\s+'([^']+)'$/);
+      if (trimmed.includes('BOT') || trimmed.includes("'SourceTV'")) {
+        continue;
+      }
 
-      if (match) {
-        const timeStr = match[2];
-        const ping = parseInt(match[3], 10);
-        const name = match[8];
+      const nameMatch = trimmed.match(/'([^']+)'/);
+      if (nameMatch && /^\d+\s+/.test(trimmed)) {
+        const name = nameMatch[1].trim();
+        if (!name || name === 'SourceTV') continue;
 
-        if (timeStr === 'BOT' || name === 'SourceTV' || name === '') {
-          continue;
-        }
+        const tokens = trimmed.split(/\s+/);
+        const timeStr = tokens[1] || '00:00';
+        const ping = parseInt(tokens[2] || '0', 10);
 
         let totalSeconds = 0;
         if (timeStr.includes(':')) {
           const parts = timeStr.split(':').map(Number);
-          if (parts.length === 2) totalSeconds = parts[0] * 60 + parts[1];
-          if (parts.length === 3) totalSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+          if (parts.length === 2) totalSeconds = (parts[0] || 0) * 60 + (parts[1] || 0);
+          if (parts.length === 3) totalSeconds = (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
         }
+
+        // Kolla om raden även råkar innehålla ett 17-siffrigt SteamID64
+        const steamMatch = trimmed.match(/\b(7656\d{13})\b/);
+        const steamid64 = resolveSteamId(name, steamMatch ? steamMatch[1] : null);
 
         players.push({
           name: name,
-          ping: ping,
+          steamid64: steamid64,
+          ping: isNaN(ping) ? 0 : ping,
           time: totalSeconds
         });
       }
@@ -120,10 +224,10 @@ function extractTeamPlayers(teamObj, teamName) {
   return list;
 }
 
-// 1. Live Players Query via RCON
+// 1. Live Players Query via RCON (status_json -> status fallback -> GameDig fallback)
 app.get('/api/server/live', async (req, res) => {
   const now = Date.now();
-  if (cachedStatus && (now - lastQueryTime < 3000)) {
+  if (cachedStatus && (now - lastQueryTime < 2500)) {
     return res.json(cachedStatus);
   }
 
@@ -136,22 +240,37 @@ app.get('/api/server/live', async (req, res) => {
         host: '212.102.62.209',
         port: 25152,
         password: rconPassword,
-        timeout: 2500
+        timeout: 2200
       });
 
-      const response = await rcon.send('status');
-      await rcon.end();
+      // Kör status_json först för att få ut SteamID64 direkt
+      const jsonResponse = await rcon.send('status_json');
+      let parsedData = parseCS2StatusJson(jsonResponse);
+      let sourceMethod = 'rcon_status_json';
 
-      const { currentMap, players } = parseCS2Status(response);
+      // Om status_json klipptes eller saknade spelarlista, kör klassiska "status" på samma anslutning
+      if (!parsedData) {
+        const textResponse = await rcon.send('status');
+        parsedData = parseCS2StatusText(textResponse);
+        sourceMethod = 'rcon_status_text';
+      } else if (parsedData.players.some(p => p.steamid64 === 'unknown')) {
+        // Komplettera eventuella saknade namn/detaljer
+        parsedData.players = parsedData.players.map(p => ({
+          ...p,
+          steamid64: resolveSteamId(p.name, p.steamid64)
+        }));
+      }
+
+      await rcon.end();
 
       cachedStatus = {
         online: true,
         name: "GubbLir",
-        map: currentMap,
-        playerCount: players.length,
+        map: parsedData.currentMap,
+        playerCount: parsedData.players.length,
         maxPlayers: 10,
-        players: players,
-        source: 'rcon'
+        players: parsedData.players,
+        source: sourceMethod
       };
       lastQueryTime = now;
       return res.json(cachedStatus);
@@ -168,14 +287,20 @@ app.get('/api/server/live', async (req, res) => {
       host: '212.102.62.209',
       port: 25152,
       givenPortOnly: true,
-      maxAttempts: 2,
-      socketTimeout: 2000
+      maxAttempts: 1,
+      socketTimeout: 1500
     });
 
-    const parsedPlayers = (state.players || []).map(p => ({
-      name: p.name && p.name.trim() !== '' ? p.name : 'Spelare',
-      time: p.raw?.time || 0
-    }));
+    const parsedPlayers = (state.players || [])
+      .filter(p => p.name && p.name.trim() !== '' && p.name !== 'SourceTV')
+      .map(p => {
+        const cleanName = p.name.trim();
+        return {
+          name: cleanName,
+          steamid64: resolveSteamId(cleanName, null),
+          time: p.raw?.time || 0
+        };
+      });
 
     cachedStatus = {
       online: true,
@@ -189,7 +314,7 @@ app.get('/api/server/live', async (req, res) => {
     lastQueryTime = now;
     return res.json(cachedStatus);
   } catch (err) {
-    return res.json({
+    return res.json(cachedStatus || {
       online: true,
       map: 'de_dust2',
       playerCount: 0,
@@ -200,12 +325,32 @@ app.get('/api/server/live', async (req, res) => {
   }
 });
 
-// 2. Webhook för MatchZy Match- och Spelarstatistik
+// 2. Webhook för MatchZy (Fångar både live player_connect för SteamID64 och map_result för stats)
 app.post('/matchzy', async (req, res) => {
   const data = req.body;
 
   if (!data || !data.event) {
     return res.status(200).send('OK');
+  }
+
+  // Fånga SteamID64 direkt när någon ansluter till servern (player_connect)
+  if (data.event === 'player_connect') {
+    const pName = data.player?.name || data.player_name;
+    const pSteam = data.player?.steamid || data.player?.steamid64 || data.player_steamid;
+    if (pName && pSteam) {
+      rememberSteamId(pName, pSteam);
+      console.log(`[MatchZy Connect] Registrerade SteamID64 för ${pName}: ${pSteam}`);
+    }
+    return res.status(200).send('OK');
+  }
+
+  // Fånga även SteamID64 från freezetime_end / round_end om ny spelare kommit in
+  if (Array.isArray(data.players)) {
+    for (const p of data.players) {
+      if (p && p.name && (p.steamid || p.steamid64)) {
+        rememberSteamId(p.name, p.steamid || p.steamid64);
+      }
+    }
   }
 
   console.log(`[MatchZy Webhook] Event: ${data.event}`);
@@ -252,8 +397,8 @@ app.post('/matchzy', async (req, res) => {
       }
 
       for (const p of players) {
-        const steamId = String(p.steamid || p.steamid64 || p.id || 'unknown');
         const name = p.name || 'Gubbe';
+        const steamId = resolveSteamId(name, p.steamid || p.steamid64 || p.id);
         const s = p.stats || p;
 
         const kills = parseInt(s.kills ?? 0, 10);
@@ -283,7 +428,7 @@ app.post('/matchzy', async (req, res) => {
   return res.status(200).send('OK');
 });
 
-// 3. Topplista med självkalibrerande GubbLir Skill Rating (K/D + ADR + Winrate)
+// 3. Topplista med självkalibrerande GubbLir Skill Rating
 app.get('/api/stats/leaderboard', async (req, res) => {
   try {
     const result = await pool.query(`
@@ -314,14 +459,14 @@ app.get('/api/stats/leaderboard', async (req, res) => {
       LIMIT 100;
     `);
 
-    // Beräkna Bayesian-viktad GubbLir Rating (1000 = basnivå)
     const enriched = result.rows.map(row => {
+      rememberSteamId(row.name, row.steamid64);
+
       const matches = row.matches_played || 0;
       const kd = parseFloat(row.kd_ratio || 1.0);
       const adr = parseFloat(row.adr || 75.0);
       const winRate = parseFloat(row.win_rate ?? 50.0);
 
-      // Confidence factor: når full styrka (1.0) vid 5 spelade matcher
       const confidence = Math.min(matches / 5.0, 1.0);
       const rawDelta = ((kd - 1.0) * 350) + ((adr - 75.0) * 4.5) + ((winRate - 50.0) * 3.0);
       const skillRating = Math.round(1000 + (rawDelta * confidence));
@@ -353,7 +498,7 @@ app.get('/api/stats/matches', async (req, res) => {
   }
 });
 
-// 4. MatchZy Dynamic Config Endpoint (Anropas av CS2-servern vid matchzy_loadmatch_url)
+// 4. MatchZy Dynamic Config Endpoint
 app.get('/api/match/latest-config.json', (req, res) => {
   if (!latestBalancedMatchConfig) {
     return res.status(404).json({ error: 'Ingen aktiv matchkonfiguration sparad' });
@@ -367,12 +512,12 @@ app.post('/api/match/push-to-server', async (req, res) => {
   const expectedPassword = process.env.CS2_SERVER_PASSWORD || 'gubbe1337';
 
   if (!password || password !== expectedPassword) {
-    return res.status(403).json({ error: 'Ogiltigt medlemslösenord' });
+    return res.status(403).json({ error: 'Ogiltigt medlemslösenord (logga ut och in igen på hemsidan)' });
   }
 
   const rconPassword = process.env.RCON_PASSWORD;
   if (!rconPassword) {
-    return res.status(500).json({ error: 'RCON_PASSWORD saknas på Render-servern' });
+    return res.status(500).json({ error: 'RCON_PASSWORD saknas under Environment på Render!' });
   }
 
   if (!Array.isArray(teamCT) || !Array.isArray(teamT) || teamCT.length === 0 || teamT.length === 0) {
@@ -385,27 +530,41 @@ app.post('/api/match/push-to-server', async (req, res) => {
       host: '212.102.62.209',
       port: 25152,
       password: rconPassword,
-      timeout: 3500
+      timeout: 4000
     });
 
-    const ctNames = teamCT.map(p => p.name).join(', ');
-    const tNames = teamT.map(p => p.name).join(', ');
+    // Kör en snabb status_json först så att eventuella nyanslutna spelare får sitt SteamID64 direkt
+    try {
+      const liveJson = await rcon.send('status_json');
+      parseCS2StatusJson(liveJson);
+    } catch (e) {}
 
-    // Annonsera de balanserade lagen tydligt i CS2-chatten
+    // Slå upp SteamID64 för varje spelare via vårt cache-minne om frontend saknade det
+    const resolvedCT = teamCT.map(p => ({
+      ...p,
+      steamid64: resolveSteamId(p.name, p.steamid64)
+    }));
+    const resolvedT = teamT.map(p => ({
+      ...p,
+      steamid64: resolveSteamId(p.name, p.steamid64)
+    }));
+
+    const ctNames = resolvedCT.map(p => p.name).join(', ');
+    const tNames = resolvedT.map(p => p.name).join(', ');
+
     await rcon.send(`say "=== [GubbLir Lagbalanserare] ==="`);
     await rcon.send(`say "LAG CT: ${ctNames}"`);
     await rcon.send(`say "LAG T: ${tNames}"`);
 
-    const allPlayers = [...teamCT, ...teamT];
-    const allHaveSteamId = allPlayers.length >= 2 && allPlayers.every(p => p.steamid64 && p.steamid64 !== 'unknown');
+    const allPlayers = [...resolvedCT, ...resolvedT];
+    const allHaveSteamId = allPlayers.length >= 2 && allPlayers.every(p => isValidSteamId64(p.steamid64));
 
-    // Om användaren valde att ladda full MatchZy-konfig och alla har SteamID64 i databasen
     if (mode === 'load_match' && allHaveSteamId) {
       const ctPlayersObj = {};
-      teamCT.forEach(p => { ctPlayersObj[String(p.steamid64)] = p.name; });
+      resolvedCT.forEach(p => { ctPlayersObj[String(p.steamid64)] = p.name; });
 
       const tPlayersObj = {};
-      teamT.forEach(p => { tPlayersObj[String(p.steamid64)] = p.name; });
+      resolvedT.forEach(p => { tPlayersObj[String(p.steamid64)] = p.name; });
 
       const chosenMap = (map && map.startsWith('de_')) ? map : 'de_mirage';
 
@@ -423,7 +582,7 @@ app.post('/api/match/push-to-server', async (req, res) => {
         maplist: [chosenMap],
         map_sides: ["team1_ct"],
         clinch_series: true,
-        players_per_team: Math.max(teamCT.length, teamT.length)
+        players_per_team: Math.max(resolvedCT.length, resolvedT.length)
       };
 
       const selfUrl = process.env.RENDER_EXTERNAL_URL || 'https://matchzy-uploader.onrender.com';
@@ -437,7 +596,6 @@ app.post('/api/match/push-to-server', async (req, res) => {
       });
     }
 
-    // Om en specifik karta valdes men någon spelare är helt ny (saknar SteamID64 i DB):
     if (map && map.startsWith('de_') && mode === 'load_match') {
       await rcon.send(`css_map ${map}`);
     }
@@ -447,14 +605,14 @@ app.post('/api/match/push-to-server', async (req, res) => {
       ok: true,
       method: 'chat_announce',
       message: allHaveSteamId
-        ? 'Laguppställningen har skickats ut i CS2-chatten!'
-        : 'Lagen har postats i CS2-chatten! (Någon spelare är ny och saknar SteamID i databasen för auto-flytt, men kommer registreras efter denna match).'
+        ? 'Laguppställningen har postats i CS2-chatten!'
+        : 'Lagen postades i CS2-chatten! (Kartan byttes, men minst en spelare i listan är inte inne på servern än och saknar känt SteamID64).'
     });
 
   } catch (err) {
     if (rcon) try { await rcon.end(); } catch (e) {}
     console.error('RCON Push Error:', err);
-    return res.status(500).json({ error: 'Kunde inte nå CS2-servern via RCON' });
+    return res.status(500).json({ error: `RCON-fel: ${err.message || 'Kunde inte ansluta till CS2-servern'}` });
   }
 });
 
