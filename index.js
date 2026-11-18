@@ -1,4 +1,5 @@
-// Körs i Node.js på Render (matchzy-uploader)
+// Körs i Node.js på Render (Repo: matchzy-uploader / Fil: index.js)
+// Krav på Environment Variables i Render: DATABASE_URL, RCON_PASSWORD
 const express = require('express');
 const { S3Client } = require('@aws-sdk/client-s3');
 const { Upload } = require('@aws-sdk/lib-storage');
@@ -9,16 +10,18 @@ const { Pool } = require('pg');
 
 const app = express();
 
-// Parsa JSON-bodies för MatchZy webhooks
 app.use(express.json({ limit: '10mb' }));
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
   next();
 });
 
-// Databasanslutning (Supabase PostgreSQL)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
@@ -30,19 +33,18 @@ const s3 = new S3Client({
   region: 'auto',
   endpoint: process.env.S3_ENDPOINT,
   credentials: {
-    accessKeyId: process.env.S3_ACCESS_KEY_ID,
-    secretAccessKey: process.env.S3_SECRET_ACCESS_KEY,
+    accessKeyId: process.env.S3_ACCESS_KEY_ID || '',
+    secretAccessKey: process.env.S3_SECRET_ACCESS_KEY || '',
   },
 });
 
 let cachedStatus = null;
 let lastQueryTime = 0;
+let latestBalancedMatchConfig = null;
 
-// Exakt parser för Source 2 / CS2 status
 function parseCS2Status(rawText) {
   const players = [];
   const lines = rawText.split('\n');
-
   let currentMap = 'de_dust2';
 
   const mapMatch = rawText.match(/Map\s+"([^"]+)"/i) || rawText.match(/spawngroup\(\s*1\)\s*:\s*SV:\s*\[\d+:\s*([^\s|]+)/i);
@@ -96,7 +98,6 @@ function parseCS2Status(rawText) {
   return { currentMap, players };
 }
 
-// Hjälpfunktion för att extrahera spelare oavsett om MatchZy skickar Array eller Object
 function extractTeamPlayers(teamObj, teamName) {
   const list = [];
   if (!teamObj || !teamObj.players) return list;
@@ -207,9 +208,8 @@ app.post('/matchzy', async (req, res) => {
     return res.status(200).send('OK');
   }
 
-  console.log(`[MatchZy Webhook] Event: ${data.event}`, JSON.stringify(data).slice(0, 600));
+  console.log(`[MatchZy Webhook] Event: ${data.event}`);
 
-  // Spara enbart vid map_result (där kartnamn, rundpoäng och spelarstats finns)
   if (data.event === 'map_result') {
     const client = await pool.connect();
     try {
@@ -230,7 +230,6 @@ app.post('/matchzy', async (req, res) => {
         else winner = 'Oavgjort';
       }
 
-      // Spara eller uppdatera matchen
       await client.query(`
         INSERT INTO matches (match_id, map_name, team1_name, team1_score, team2_name, team2_score, winner)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -243,13 +242,11 @@ app.post('/matchzy', async (req, res) => {
           winner = EXCLUDED.winner;
       `, [matchId, mapName, team1Name, team1Score, team2Name, team2Score, winner]);
 
-      // Samla alla spelare från båda lagen (stödjer både Array och Object)
       const players = [
         ...extractTeamPlayers(data.team1, team1Name),
         ...extractTeamPlayers(data.team2, team2Name)
       ];
 
-      // Rensa eventuella gamla rader för samma match_id vid omskickning
       if (players.length > 0) {
         await client.query('DELETE FROM player_stats WHERE match_id = $1;', [matchId]);
       }
@@ -286,30 +283,56 @@ app.post('/matchzy', async (req, res) => {
   return res.status(200).send('OK');
 });
 
-// 3. API Endpoints för Frontend / Leaderboard
+// 3. Topplista med självkalibrerande GubbLir Skill Rating (K/D + ADR + Winrate)
 app.get('/api/stats/leaderboard', async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT 
-        steamid64,
-        MAX(name) AS name,
-        COUNT(DISTINCT match_id)::int AS matches_played,
-        SUM(kills)::int AS total_kills,
-        SUM(deaths)::int AS total_deaths,
-        SUM(assists)::int AS total_assists,
-        SUM(headshots)::int AS total_headshots,
-        SUM(damage)::int AS total_damage,
-        SUM(rounds_played)::int AS total_rounds,
-        SUM(mvps)::int AS total_mvps,
-        ROUND(SUM(kills)::numeric / NULLIF(SUM(deaths), 0), 2) AS kd_ratio,
-        ROUND((SUM(headshots)::numeric / NULLIF(SUM(kills), 0)) * 100, 1) AS hs_percentage
-      FROM player_stats
-      WHERE steamid64 != 'unknown'
-      GROUP BY steamid64
+        ps.steamid64,
+        MAX(ps.name) AS name,
+        COUNT(DISTINCT ps.match_id)::int AS matches_played,
+        COUNT(DISTINCT CASE WHEN m.winner = ps.team THEN ps.match_id END)::int AS matches_won,
+        ROUND(
+          (COUNT(DISTINCT CASE WHEN m.winner = ps.team THEN ps.match_id END)::numeric / NULLIF(COUNT(DISTINCT ps.match_id), 0)) * 100,
+          0
+        )::int AS win_rate,
+        SUM(ps.kills)::int AS total_kills,
+        SUM(ps.deaths)::int AS total_deaths,
+        SUM(ps.assists)::int AS total_assists,
+        SUM(ps.headshots)::int AS total_headshots,
+        SUM(ps.damage)::int AS total_damage,
+        SUM(ps.rounds_played)::int AS total_rounds,
+        SUM(ps.mvps)::int AS total_mvps,
+        ROUND(SUM(ps.kills)::numeric / NULLIF(SUM(ps.deaths), 0), 2) AS kd_ratio,
+        ROUND(SUM(ps.damage)::numeric / NULLIF(SUM(ps.rounds_played), 0), 1) AS adr,
+        ROUND((SUM(ps.headshots)::numeric / NULLIF(SUM(ps.kills), 0)) * 100, 1) AS hs_percentage
+      FROM player_stats ps
+      LEFT JOIN matches m ON ps.match_id = m.match_id
+      WHERE ps.steamid64 != 'unknown'
+      GROUP BY ps.steamid64
       ORDER BY kd_ratio DESC NULLS LAST, total_kills DESC
       LIMIT 100;
     `);
-    res.json(result.rows);
+
+    // Beräkna Bayesian-viktad GubbLir Rating (1000 = basnivå)
+    const enriched = result.rows.map(row => {
+      const matches = row.matches_played || 0;
+      const kd = parseFloat(row.kd_ratio || 1.0);
+      const adr = parseFloat(row.adr || 75.0);
+      const winRate = parseFloat(row.win_rate ?? 50.0);
+
+      // Confidence factor: når full styrka (1.0) vid 5 spelade matcher
+      const confidence = Math.min(matches / 5.0, 1.0);
+      const rawDelta = ((kd - 1.0) * 350) + ((adr - 75.0) * 4.5) + ((winRate - 50.0) * 3.0);
+      const skillRating = Math.round(1000 + (rawDelta * confidence));
+
+      return {
+        ...row,
+        skill_rating: Math.max(400, skillRating)
+      };
+    });
+
+    res.json(enriched);
   } catch (err) {
     console.error('Kunde inte hämta leaderboard:', err);
     res.status(500).json({ error: 'Kunde inte hämta leaderboard' });
@@ -330,7 +353,112 @@ app.get('/api/stats/matches', async (req, res) => {
   }
 });
 
-// 4. Demo Upload från MatchZy
+// 4. MatchZy Dynamic Config Endpoint (Anropas av CS2-servern vid matchzy_loadmatch_url)
+app.get('/api/match/latest-config.json', (req, res) => {
+  if (!latestBalancedMatchConfig) {
+    return res.status(404).json({ error: 'Ingen aktiv matchkonfiguration sparad' });
+  }
+  res.json(latestBalancedMatchConfig);
+});
+
+// 5. Pusha balanserade lag & karta direkt till CS2-servern via RCON
+app.post('/api/match/push-to-server', async (req, res) => {
+  const { password, mode, map, teamCT, teamT } = req.body || {};
+  const expectedPassword = process.env.CS2_SERVER_PASSWORD || 'gubbe1337';
+
+  if (!password || password !== expectedPassword) {
+    return res.status(403).json({ error: 'Ogiltigt medlemslösenord' });
+  }
+
+  const rconPassword = process.env.RCON_PASSWORD;
+  if (!rconPassword) {
+    return res.status(500).json({ error: 'RCON_PASSWORD saknas på Render-servern' });
+  }
+
+  if (!Array.isArray(teamCT) || !Array.isArray(teamT) || teamCT.length === 0 || teamT.length === 0) {
+    return res.status(400).json({ error: 'Ogiltiga laguppställningar' });
+  }
+
+  let rcon;
+  try {
+    rcon = await Rcon.connect({
+      host: '212.102.62.209',
+      port: 25152,
+      password: rconPassword,
+      timeout: 3500
+    });
+
+    const ctNames = teamCT.map(p => p.name).join(', ');
+    const tNames = teamT.map(p => p.name).join(', ');
+
+    // Annonsera de balanserade lagen tydligt i CS2-chatten
+    await rcon.send(`say "=== [GubbLir Lagbalanserare] ==="`);
+    await rcon.send(`say "LAG CT: ${ctNames}"`);
+    await rcon.send(`say "LAG T: ${tNames}"`);
+
+    const allPlayers = [...teamCT, ...teamT];
+    const allHaveSteamId = allPlayers.length >= 2 && allPlayers.every(p => p.steamid64 && p.steamid64 !== 'unknown');
+
+    // Om användaren valde att ladda full MatchZy-konfig och alla har SteamID64 i databasen
+    if (mode === 'load_match' && allHaveSteamId) {
+      const ctPlayersObj = {};
+      teamCT.forEach(p => { ctPlayersObj[String(p.steamid64)] = p.name; });
+
+      const tPlayersObj = {};
+      teamT.forEach(p => { tPlayersObj[String(p.steamid64)] = p.name; });
+
+      const chosenMap = (map && map.startsWith('de_')) ? map : 'de_mirage';
+
+      latestBalancedMatchConfig = {
+        matchid: Math.floor(Date.now() / 1000),
+        team1: {
+          name: "Lag CT",
+          players: ctPlayersObj
+        },
+        team2: {
+          name: "Lag T",
+          players: tPlayersObj
+        },
+        num_maps: 1,
+        maplist: [chosenMap],
+        map_sides: ["team1_ct"],
+        clinch_series: true,
+        players_per_team: Math.max(teamCT.length, teamT.length)
+      };
+
+      const selfUrl = process.env.RENDER_EXTERNAL_URL || 'https://matchzy-uploader.onrender.com';
+      await rcon.send(`matchzy_loadmatch_url "${selfUrl}/api/match/latest-config.json"`);
+      await rcon.end();
+
+      return res.json({
+        ok: true,
+        method: 'matchzy_loadmatch_url',
+        message: 'Lagen och kartan har laddats in automatiskt i MatchZy på servern!'
+      });
+    }
+
+    // Om en specifik karta valdes men någon spelare är helt ny (saknar SteamID64 i DB):
+    if (map && map.startsWith('de_') && mode === 'load_match') {
+      await rcon.send(`css_map ${map}`);
+    }
+
+    await rcon.end();
+    return res.json({
+      ok: true,
+      method: 'chat_announce',
+      message: allHaveSteamId
+        ? 'Laguppställningen har skickats ut i CS2-chatten!'
+        : 'Lagen har postats i CS2-chatten! (Någon spelare är ny och saknar SteamID i databasen för auto-flytt, men kommer registreras efter denna match).'
+    });
+
+  } catch (err) {
+    if (rcon) try { await rcon.end(); } catch (e) {}
+    console.error('RCON Push Error:', err);
+    return res.status(500).json({ error: 'Kunde inte nå CS2-servern via RCON' });
+  }
+});
+
+// 6. Demo Upload från MatchZy
 app.post('/upload', async (req, res) => {
   try {
     const dateStr = new Date().toISOString().replace(/[:.]/g, '-');
