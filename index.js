@@ -49,19 +49,16 @@ function normalizeToSteamId64(rawId) {
   if (!rawId) return null;
   const str = String(rawId).trim();
 
-  // Redan SteamID64
   if (/^7656\d{13}$/.test(str)) {
     return str;
   }
 
-  // Steam3 format: [U:1:215989239]
   const steam3Match = str.match(/^\[?U:1:(\d+)\]?$/i);
   if (steam3Match) {
     const accountId = BigInt(steam3Match[1]);
     return (76561197960265728n + accountId).toString();
   }
 
-  // Steam2 format: STEAM_1:1:107994619
   const steam2Match = str.match(/^STEAM_[01]:([01]):(\d+)$/i);
   if (steam2Match) {
     const y = BigInt(steam2Match[1]);
@@ -225,7 +222,6 @@ function parseCS2StatusText(rawText) {
   return { currentMap, players };
 }
 
-// Extraherar spelare oavsett struktur i MatchZy-webhooken
 function extractTeamPlayers(teamObj, teamName) {
   const list = [];
   if (!teamObj) return list;
@@ -357,7 +353,7 @@ app.get('/api/server/live', async (req, res) => {
   }
 });
 
-// 2. Webhook för MatchZy
+// 2. Webhook för MatchZy (Fångar player_connect, round_end, map_result och series_end)
 app.post('/matchzy', async (req, res) => {
   const data = req.body;
 
@@ -365,6 +361,7 @@ app.post('/matchzy', async (req, res) => {
     return res.status(200).send('OK');
   }
 
+  // Fånga SteamID64 direkt vid anslutning
   if (data.event === 'player_connect') {
     const pName = data.player?.name || data.player_name;
     const pSteam = data.player?.steamid || data.player?.steamid64 || data.player_steamid;
@@ -374,25 +371,17 @@ app.post('/matchzy', async (req, res) => {
     return res.status(200).send('OK');
   }
 
-  if (Array.isArray(data.players)) {
-    for (const p of data.players) {
-      if (p && p.name && (p.steamid || p.steamid64)) {
-        rememberSteamId(p.name, p.steamid || p.steamid64);
-      }
-    }
-  }
+  console.log(`[MatchZy Webhook] Event: ${data.event} | Keys: ${Object.keys(data).join(',')}`);
 
-  console.log(`[MatchZy Webhook] Event: ${data.event} | Payload:`, JSON.stringify(data).slice(0, 1200));
-
-  if (data.event === 'map_result') {
+  // Spara match + spelarstats vid round_end, map_result eller series_end
+  if (data.event === 'round_end' || data.event === 'map_result' || data.event === 'series_end') {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
 
-      const mapNum = data.map_number !== undefined ? `_${data.map_number}` : '';
+      const mapNum = data.map_number !== undefined ? `_${data.map_number}` : '_0';
       const matchId = String(data.matchid ? `${data.matchid}${mapNum}` : `match_${Date.now()}`);
-      
-      // Hämta kartnamn oavsett nyckelformat i MatchZy + fallback på live-serverns karta
+
       const resolvedMap =
         data.map_name ||
         data.mapname ||
@@ -409,55 +398,64 @@ app.post('/matchzy', async (req, res) => {
       if (!winner) {
         if (data.winner?.team === 'team1' || team1Score > team2Score) winner = team1Name;
         else if (data.winner?.team === 'team2' || team2Score > team1Score) winner = team2Name;
-        else winner = 'Oavgjort';
+        else winner = 'Pågår';
       }
 
-      await client.query(`
-        INSERT INTO matches (match_id, map_name, team1_name, team1_score, team2_name, team2_score, winner)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (match_id) DO UPDATE SET
-          map_name = EXCLUDED.map_name,
-          team1_name = EXCLUDED.team1_name,
-          team1_score = EXCLUDED.team1_score,
-          team2_name = EXCLUDED.team2_name,
-          team2_score = EXCLUDED.team2_score,
-          winner = EXCLUDED.winner;
-      `, [matchId, resolvedMap, team1Name, team1Score, team2Name, team2Score, winner]);
+      if (data.event !== 'series_end' || (team1Score + team2Score) > 0) {
+        await client.query(`
+          INSERT INTO matches (match_id, map_name, team1_name, team1_score, team2_name, team2_score, winner)
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          ON CONFLICT (match_id) DO UPDATE SET
+            map_name = CASE WHEN EXCLUDED.map_name != 'de_unknown' THEN EXCLUDED.map_name ELSE matches.map_name END,
+            team1_name = EXCLUDED.team1_name,
+            team1_score = GREATEST(EXCLUDED.team1_score, matches.team1_score),
+            team2_name = EXCLUDED.team2_name,
+            team2_score = GREATEST(EXCLUDED.team2_score, matches.team2_score),
+            winner = EXCLUDED.winner;
+        `, [matchId, resolvedMap, team1Name, team1Score, team2Name, team2Score, winner]);
+      }
 
-      const players = [
+      let players = [
         ...extractTeamPlayers(data.team1, team1Name),
         ...extractTeamPlayers(data.team2, team2Name)
       ];
 
-      if (players.length > 0) {
-        await client.query('DELETE FROM player_stats WHERE match_id = $1;', [matchId]);
+      if (players.length === 0 && Array.isArray(data.players)) {
+        players = data.players.map(p => ({
+          ...p,
+          team: p.team === 'team1' ? team1Name : (p.team === 'team2' ? team2Name : (p.team || team1Name))
+        }));
       }
 
-      for (const p of players) {
-        const name = String(p.name || 'Gubbe').trim();
-        const rawCandidate = p.steamid || p.steamid64 || p.xuid || p.id;
-        const steamId = resolveSteamId(name, rawCandidate);
-        const s = p.stats || p;
+      if (players.length > 0) {
+        await client.query('DELETE FROM player_stats WHERE match_id = $1;', [matchId]);
 
-        const kills = parseInt(s.kills ?? 0, 10);
-        const deaths = parseInt(s.deaths ?? 0, 10);
-        const assists = parseInt(s.assists ?? 0, 10);
-        const headshots = parseInt(s.headshot_kills ?? s.headshots ?? 0, 10);
-        const damage = parseInt(s.damage ?? 0, 10);
-        const rounds = parseInt(s.rounds_played ?? s.roundsplayed ?? (team1Score + team2Score), 10);
-        const mvps = parseInt(s.mvp ?? s.mvps ?? 0, 10);
+        for (const p of players) {
+          const name = String(p.name || 'Gubbe').trim();
+          const rawCandidate = p.steamid || p.steamid64 || p.xuid || p.id;
+          const steamId = resolveSteamId(name, rawCandidate);
+          const s = p.stats || p;
 
-        await client.query(`
-          INSERT INTO player_stats (match_id, steamid64, name, team, kills, deaths, assists, headshots, damage, rounds_played, mvps)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11);
-        `, [matchId, steamId, name, p.team, kills, deaths, assists, headshots, damage, rounds, mvps]);
+          const kills = parseInt(s.kills ?? 0, 10);
+          const deaths = parseInt(s.deaths ?? 0, 10);
+          const assists = parseInt(s.assists ?? 0, 10);
+          const headshots = parseInt(s.headshot_kills ?? s.headshots ?? 0, 10);
+          const damage = parseInt(s.damage ?? 0, 10);
+          const rounds = parseInt(s.rounds_played ?? s.roundsplayed ?? Math.max(1, team1Score + team2Score), 10);
+          const mvps = parseInt(s.mvp ?? s.mvps ?? 0, 10);
+
+          await client.query(`
+            INSERT INTO player_stats (match_id, steamid64, name, team, kills, deaths, assists, headshots, damage, rounds_played, mvps)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11);
+          `, [matchId, steamId, name, p.team, kills, deaths, assists, headshots, damage, rounds, mvps]);
+        }
+        console.log(`[MatchZy Webhook] Uppdaterade ${players.length} spelare för match ${matchId} (${data.event})`);
       }
 
       await client.query('COMMIT');
-      console.log(`[MatchZy Webhook] Sparade match ${matchId} (${resolvedMap} ${team1Score}-${team2Score}) och ${players.length} spelare!`);
     } catch (dbErr) {
       await client.query('ROLLBACK');
-      console.error('[MatchZy Webhook] Databasfel vid sparande:', dbErr);
+      console.error('[MatchZy Webhook] Databasfel:', dbErr);
     } finally {
       client.release();
     }
@@ -466,7 +464,7 @@ app.post('/matchzy', async (req, res) => {
   return res.status(200).send('OK');
 });
 
-// 3. Topplista (Grupperar på SteamID64, med fallback på spelarnamn så ingen någonsin döljs)
+// 3. Topplista med självkalibrerande GubbLir Skill Rating
 app.get('/api/stats/leaderboard', async (req, res) => {
   try {
     const result = await pool.query(`
